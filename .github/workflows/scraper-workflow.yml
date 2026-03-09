@@ -2,8 +2,8 @@ name: Scrape after55.com → Supabase
 
 on:
   schedule:
-    - cron: '0 6 * * 1'   # Every Monday at 6:00 AM UTC
-  workflow_dispatch:        # Also allows manual runs from the Actions tab
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
 
 jobs:
   scrape:
@@ -19,7 +19,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Python dependencies
+      - name: Install dependencies
         run: pip install requests playwright beautifulsoup4
 
       - name: Install Playwright browsers
@@ -28,10 +28,12 @@ jobs:
       - name: Run scraper
         run: python after55_scraper.py
 
-      - name: Upload log
+      - name: Upload debug artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: scraper-log
-          path: after55_scraper.log
+          name: scraper-debug
+          path: |
+            after55_scraper.log
+            debug_screenshot.png
           retention-days: 30

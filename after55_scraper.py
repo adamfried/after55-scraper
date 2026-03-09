@@ -1,14 +1,12 @@
 """
 after55.com Active Adult Properties Scraper → Supabase
 =======================================================
-Uses Playwright (real Chromium browser) to bypass 403 bot protection.
-Scrapes all 750 active adult properties across the US and inserts
-them into your Supabase `properties` table.
+v4 — Waits properly for JS-rendered listings, takes a debug screenshot,
+and tries multiple strategies to find property links.
 """
 
 import re
 import time
-import json
 import logging
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
@@ -16,9 +14,9 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 # ── Supabase credentials ──────────────────────────────────────────────────────
 SUPABASE_URL = "https://qvaofqcvjrozsrbhixzc.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InF2YW9mcWN2anJvenNyYmhpeHpjIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MzAzMTg2MCwiZXhwIjoyMDg4NjA3ODYwfQ.Y92P-jRJPrFfe9ZtDf0hO15qMvFdK0GqPLecDnXrlSE"
-TABLE        = "properties"
+TABLE = "properties"
 
-# ── The exact working search URL (US-wide, Active Adult toggled on) ───────────
+# ── Search URL — full US, Active Adult ───────────────────────────────────────
 SEARCH_BASE = (
     "https://www.after55.com/search/specialties-active-adult"
     "?bounds=50.68745,23.1298,-73.54957,-123.77906"
@@ -50,12 +48,10 @@ SEARCH_BASE = (
     ",-125.62677|50.61140"
 )
 
-# ── Configuration ─────────────────────────────────────────────────────────────
-DELAY_SECONDS  = 2.0
-PAGE_LOAD_WAIT = 5000   # ms to wait for JS to render listings
-BATCH_SIZE     = 25
-LOG_FILE       = "after55_scraper.log"
-BASE_URL       = "https://www.after55.com"
+DELAY_SECONDS = 2.5
+BATCH_SIZE    = 25
+LOG_FILE      = "after55_scraper.log"
+BASE_URL      = "https://www.after55.com"
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -74,30 +70,91 @@ SUPA_HEADERS = {
 }
 
 def insert_rows(rows):
-    url = f"{SUPABASE_URL}/rest/v1/{TABLE}"
-    r = requests.post(url, headers=SUPA_HEADERS, json=rows, timeout=30)
+    r = requests.post(
+        f"{SUPABASE_URL}/rest/v1/{TABLE}",
+        headers=SUPA_HEADERS, json=rows, timeout=30
+    )
     if r.status_code in (200, 201):
-        log.info(f"  ✓ Inserted {len(rows)} rows into Supabase")
+        log.info(f"  ✓ Inserted {len(rows)} rows")
     else:
         log.error(f"  ✗ Insert failed {r.status_code}: {r.text[:300]}")
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def txt(el):
-    return el.inner_text().strip() if el else ""
+# ── Wait for JS-rendered listings ────────────────────────────────────────────
+def wait_for_listings_to_render(page):
+    """
+    after55.com is a React app. We need to wait until actual property cards
+    appear in the DOM — not just the initial HTML shell.
+    Try several selectors that appear only after JS renders listings.
+    """
+    selectors_to_try = [
+        # Property card links — the most direct signal
+        "a[href*='/ca/'], a[href*='/tx/'], a[href*='/fl/'], a[href*='/ny/'], a[href*='/wa/']",
+        # Heading inside a card
+        "h2 a[href], h3 a[href]",
+        # Generic: any link whose href is a short path with 7-char ID
+        "a[href]",
+    ]
 
-def re_int(pattern, text):
-    m = re.search(pattern, text)
-    return int(m.group(1)) if m else None
+    log.info("Waiting for listings to render (up to 30s)...")
 
-def re_str(pattern, text):
-    m = re.search(pattern, text)
-    return m.group(1).strip() if m else ""
+    # First just wait for any <h2> to appear (property card titles)
+    try:
+        page.wait_for_selector("h2", timeout=20000)
+        log.info("  <h2> elements detected — page has rendered content")
+    except PWTimeout:
+        log.warning("  No <h2> found after 20s")
+
+    # Extra wait for React hydration
+    page.wait_for_timeout(5000)
+
+    # Log all h2 text to understand what rendered
+    h2s = page.eval_on_selector_all("h2", "els => els.map(e => e.innerText.trim()).slice(0,10)")
+    log.info(f"  H2 elements on page: {h2s}")
+
+    # Log total anchor count
+    n_links = page.eval_on_selector_all("a[href]", "els => els.length")
+    log.info(f"  Total <a href> elements: {n_links}")
+
+    # Dump ALL hrefs so we can see exactly what's there
+    all_hrefs = page.eval_on_selector_all(
+        "a[href]",
+        "els => els.map(e => e.getAttribute('href')).filter(h => h && !h.startsWith('#')).slice(0, 50)"
+    )
+    log.info(f"  First 50 non-anchor hrefs: {all_hrefs}")
+
+    # Save a screenshot for visual debugging
+    try:
+        page.screenshot(path="debug_screenshot.png", full_page=False)
+        log.info("  Screenshot saved: debug_screenshot.png")
+    except Exception as e:
+        log.warning(f"  Screenshot failed: {e}")
+
+    # Also dump a snippet of page HTML for debugging
+    html_snippet = page.eval_on_selector("body", "el => el.innerHTML.slice(0, 3000)")
+    log.info(f"  Body HTML snippet:\n{html_snippet}\n")
 
 
-# ── Collect all listing URLs from paginated search ────────────────────────────
+# ── Extract property URLs from current page ───────────────────────────────────
+def extract_property_urls(page):
+    all_hrefs = page.eval_on_selector_all(
+        "a[href]",
+        "els => els.map(e => e.getAttribute('href'))"
+    )
+    urls = []
+    for href in all_hrefs:
+        if not href:
+            continue
+        # Match /st/city/property-slug/7-8charid  e.g. /ca/los-angeles/some-place/abc1234
+        if re.match(r"^/[a-z]{2}/[^/]+/[^/]+/[a-z0-9]{6,9}$", href):
+            full = BASE_URL + href
+            if full not in urls:
+                urls.append(full)
+    return urls
+
+
+# ── Collect all listing URLs ──────────────────────────────────────────────────
 def collect_listing_urls(page):
-    """Page through the US-wide active adult search and collect all property URLs."""
     all_urls = []
     search_page = 1
 
@@ -105,48 +162,47 @@ def collect_listing_urls(page):
         if search_page == 1:
             url = SEARCH_BASE
         else:
-            url = SEARCH_BASE + f"&page={search_page}"
+            base_path = SEARCH_BASE.split("?")[0]
+            query     = SEARCH_BASE.split("?")[1]
+            url = f"{base_path}/page-{search_page}?{query}"
 
-        log.info(f"Search page {search_page}: {url[:80]}…")
+        log.info(f"\n--- Search page {search_page} ---")
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(PAGE_LOAD_WAIT)
+            resp = page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            log.info(f"Status: {resp.status if resp else '?'}  Final URL: {page.url[:80]}")
         except PWTimeout:
-            log.warning(f"Timeout loading search page {search_page}, stopping.")
+            log.warning("Timeout loading search page. Stopping.")
             break
 
-        # Grab all property links on this page
-        links = page.query_selector_all("a[href]")
-        new_urls = []
-        for link in links:
-            href = link.get_attribute("href") or ""
-            # Property pages: /st/city/property-name/7charID
-            if re.match(r"^/[a-z]{2}/[^/]+/[^/]+/[a-z0-9]{7}$", href):
-                full = BASE_URL + href
-                if full not in all_urls and full not in new_urls:
-                    new_urls.append(full)
+        # On first page, do full debug logging
+        if search_page == 1:
+            wait_for_listings_to_render(page)
+        else:
+            page.wait_for_timeout(7000)
+
+        new_urls = extract_property_urls(page)
+        log.info(f"Property URLs found on this page: {len(new_urls)}")
+        for u in new_urls[:5]:
+            log.info(f"  {u}")
 
         if not new_urls:
-            log.info(f"No new listings on page {search_page}. Done collecting.")
+            log.info("No listings found — stopping pagination.")
             break
 
         all_urls.extend(new_urls)
-        log.info(f"  Found {len(new_urls)} listings (total: {len(all_urls)})")
+        log.info(f"Running total: {len(all_urls)}")
 
-        # Check if there's a next page
-        next_btn = page.query_selector("a[href*='page-']:last-of-type, [aria-label='Next page']")
-        if not next_btn:
-            # Also check for page numbers in the URL pattern
-            page_links = page.query_selector_all("a[href*='page-']")
-            page_nums = []
-            for pl in page_links:
-                h = pl.get_attribute("href") or ""
-                m = re.search(r"page-(\d+)", h)
-                if m:
-                    page_nums.append(int(m.group(1)))
-            if not page_nums or search_page >= max(page_nums):
-                log.info("Reached last search page.")
-                break
+        # Check for next page link
+        page_nums = []
+        for href in page.eval_on_selector_all("a[href*='page-']", "els => els.map(e => e.getAttribute('href'))"):
+            m = re.search(r"page-(\d+)", href or "")
+            if m:
+                page_nums.append(int(m.group(1)))
+        log.info(f"Pagination pages found: {sorted(set(page_nums))}")
+
+        if not page_nums or search_page >= max(page_nums):
+            log.info("No more pages.")
+            break
 
         search_page += 1
         time.sleep(DELAY_SECONDS)
@@ -154,32 +210,31 @@ def collect_listing_urls(page):
     return list(dict.fromkeys(all_urls))
 
 
-# ── Scrape a single property detail page ─────────────────────────────────────
+# ── Scrape one property page ──────────────────────────────────────────────────
 def scrape_listing(page, url):
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=30000)
         page.wait_for_timeout(3000)
     except PWTimeout:
-        log.warning(f"Timeout loading {url}")
+        log.warning(f"Timeout: {url}")
         return None
 
     content = page.content()
     data = {"listing_url": url}
 
-    # Name
     h1 = page.query_selector("h1")
-    data["name"] = txt(h1)
+    data["name"] = h1.inner_text().strip() if h1 else ""
 
-    # Address — find text matching "Street, City, ST 12345"
+    # Address
     full_addr = ""
-    for sel in ["p", "div", "span"]:
-        for el in page.query_selector_all(sel):
+    for el in page.query_selector_all("p, div, span"):
+        try:
             t = el.inner_text().strip()
-            if re.search(r"\d{5}", t) and len(t) < 90:
+            if re.search(r"\d{5}", t) and 10 < len(t) < 90:
                 full_addr = t
                 break
-        if full_addr:
-            break
+        except Exception:
+            continue
     m = re.match(r"^(.*?),\s*(.*?),\s*([A-Z]{2})\s+(\d{5})", full_addr)
     if m:
         data["street"] = m.group(1).strip()
@@ -190,7 +245,7 @@ def scrape_listing(page, url):
         data["street"] = full_addr
         data["city"] = data["state"] = data["zip"] = ""
 
-    # Floor plan summary table
+    # Rent / beds / baths / sqft
     tbl = page.query_selector("table")
     if tbl:
         cells = [c.inner_text().strip() for c in tbl.query_selector_all("td")]
@@ -201,78 +256,51 @@ def scrape_listing(page, url):
     else:
         data.update({"rent_range":"","bedrooms":"","bathrooms":"","sqft_range":""})
 
-    # Property info block — "Built in 2007 · 86 units/5 stories"
+    def re_int(pat, s):
+        m = re.search(pat, s); return int(m.group(1)) if m else None
+    def re_str(pat, s):
+        m = re.search(pat, s); return m.group(1).strip() if m else ""
+
+    # Property info
     prop_info = ""
     for el in page.query_selector_all("p, li, div"):
-        t = el.inner_text().strip()
-        if "Built in" in t and "units" in t:
-            prop_info = t
-            break
+        try:
+            t = el.inner_text().strip()
+            if "Built in" in t and "units" in t:
+                prop_info = t; break
+        except Exception:
+            continue
     data["year_built"] = re_str(r"Built in (\d{4})", prop_info)
     data["unit_count"] = re_int(r"(\d+)\s+units", prop_info)
     data["stories"]    = re_int(r"(\d+)\s+stor", prop_info)
 
-    # Lease terms
-    ls = page.query_selector("text=Lease Term")
-    data["lease_terms"] = ""
-    if ls:
-        parent = ls.evaluate_handle("el => el.parentElement")
-        lis = parent.query_selector_all("li") if parent else []
-        data["lease_terms"] = ", ".join(li.inner_text().strip() for li in lis)
-
-    # Application fee & pet policy
     data["application_fee"] = re_int(r"Application Fee[^$]*\$(\d+)", content)
     pt = re.search(r"(No Pets Allowed|Dogs Allowed|Cats Allowed|Pets Allowed)", content)
     data["pet_policy"] = pt.group(1) if pt else ""
 
-    # Apartment features
-    apt_features = []
-    for el in page.query_selector_all("*"):
-        t = el.inner_text().strip()
-        if t == "Apartment Features":
-            ul = el.evaluate_handle("el => el.parentElement.nextElementSibling")
-            if ul:
-                lis = ul.query_selector_all("li")
-                apt_features = [li.inner_text().strip() for li in lis]
-            break
-    data["apartment_features"] = apt_features
+    lm = re.search(r"Lease Term[^<]*Options.*?<li[^>]*>([^<]+)</li>", content, re.DOTALL)
+    data["lease_terms"] = lm.group(1).strip() if lm else ""
 
-    # Community features
-    comm_features = []
-    for el in page.query_selector_all("*"):
-        t = el.inner_text().strip()
-        if t == "Community Features":
-            ul = el.evaluate_handle("el => el.parentElement.nextElementSibling")
-            if ul:
-                lis = ul.query_selector_all("li")
-                comm_features = [li.inner_text().strip() for li in lis]
-            break
-    data["community_features"] = comm_features
+    af = re.search(r"Apartment Features.*?<ul[^>]*>(.*?)</ul>", content, re.DOTALL)
+    data["apartment_features"] = re.findall(r"<li[^>]*>([^<]+)</li>", af.group(1)) if af else []
 
-    # Hospitals — parse from page content
+    cf = re.search(r"Community Features.*?<ul[^>]*>(.*?)</ul>", content, re.DOTALL)
+    data["community_features"] = re.findall(r"<li[^>]*>([^<]+)</li>", cf.group(1)) if cf else []
+
     hospitals = []
-    hosp_match = re.findall(
-        r'href="/hospital/[^"]+">([^<]+)</a>\s*</td>\s*<td[^>]*>([^<]+)</td>',
-        content
-    )
-    for name, commute in hosp_match[:5]:
+    for name, commute in re.findall(
+        r'href="/hospital/[^"]+">([^<]+)</a>.*?<td[^>]*>(Drive:[^<]+)</td>',
+        content, re.DOTALL
+    )[:5]:
         hospitals.append({"name": name.strip(), "commute": commute.strip()})
     data["hospitals"] = hospitals
 
-    # Scores
-    for key, label in [
-        ("walk_score","Walk Score"),("transit_score","Transit Score"),
-        ("bike_score","Bike Score"),("sound_score","Soundscore"),
-    ]:
+    for key, label in [("walk_score","Walk Score"),("transit_score","Transit Score"),
+                       ("bike_score","Bike Score"),("sound_score","Soundscore")]:
         data[key] = re_int(rf"{label}[^0-9]*(\d+)\s*/\s*100", content)
 
-    # Phone
     ph = re.search(r'tel:\+1(\d{10})', content)
-    if ph:
-        p = ph.group(1)
-        data["phone"] = f"({p[:3]}) {p[3:6]}-{p[6:]}"
-    else:
-        data["phone"] = ""
+    data["phone"] = f"({ph.group(1)[:3]}) {ph.group(1)[3:6]}-{ph.group(1)[6:]}" if ph else ""
 
     return data
 
@@ -286,6 +314,8 @@ def main():
                 "--no-sandbox",
                 "--disable-blink-features=AutomationControlled",
                 "--disable-dev-shm-usage",
+                "--disable-setuid-sandbox",
+                "--window-size=1280,900",
             ]
         )
         context = browser.new_context(
@@ -296,8 +326,8 @@ def main():
             ),
             viewport={"width": 1280, "height": 900},
             locale="en-US",
+            timezone_id="America/New_York",
         )
-        # Hide webdriver flag
         context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
@@ -305,30 +335,32 @@ def main():
 
         log.info("=== Phase 1: Collecting listing URLs ===")
         all_urls = collect_listing_urls(page)
-        log.info(f"\nTotal unique listings found: {len(all_urls)}")
+        log.info(f"\nTotal unique listings: {len(all_urls)}")
 
-        log.info("\n=== Phase 2: Scraping property detail pages ===")
+        if not all_urls:
+            log.error("Zero listings found — review the debug output above.")
+            browser.close()
+            return
+
+        log.info("\n=== Phase 2: Scraping property pages ===")
         batch, total = [], 0
-
         for i, url in enumerate(all_urls, 1):
             log.info(f"[{i}/{len(all_urls)}] {url}")
             prop = scrape_listing(page, url)
             if prop:
                 batch.append(prop)
+                log.info(f"  → {prop.get('name','?')} | {prop.get('city','?')}, {prop.get('state','?')}")
             time.sleep(DELAY_SECONDS)
-
             if len(batch) >= BATCH_SIZE:
                 insert_rows(batch)
                 total += len(batch)
                 batch = []
-
         if batch:
             insert_rows(batch)
             total += len(batch)
 
         browser.close()
-
-    log.info(f"\nDone. {total} properties inserted into Supabase.")
+    log.info(f"\nDone. {total} properties inserted.")
 
 
 if __name__ == "__main__":
